@@ -1,0 +1,5 @@
+pyinstaller==6.22.3
+pillow==13.0.0
+pystray==0.19.5
+truststore==0.10.5
+customtkinter==6.0.0

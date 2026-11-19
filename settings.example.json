@@ -1,0 +1,9 @@
+{
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "imap_user": "you@example.com",
+  "mailbox": "INBOX",
+  "telegram_chat_id": 0,
+  "language": "한국어",
+  "poll_seconds": 60
+}
