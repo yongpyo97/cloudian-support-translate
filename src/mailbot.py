@@ -109,6 +109,7 @@ CLOUDIAN_STAMP = re.compile(
 CLOUDIAN_REPLY_FOOTER = re.compile(
     r"(?im)^\s*You may reply to this email directly but please DO NOT change the subject\."
 )
+CLOUDIAN_COPY_WAIT = timedelta(seconds=30)
 QUOTED_HEADER = re.compile(
     r"(?im)^[ \t>\\]*\*{0,2}(from|sent|date|to|cc|bcc|subject|"
     r"보낸 사람|보낸 날짜|받는 사람|참조|숨은 참조|제목)\*{0,2}[ \t]*[:：][^\r\n]*"
@@ -258,6 +259,24 @@ def comment_fingerprint(author, case_id, comment):
     comment = re.sub(r"\s*:\s*", ": ", comment)
     digest = hashlib.sha256(comment.encode("utf-8")).hexdigest()
     return f"comment:{author}:{case_id[:15]}:{digest}"
+
+
+def cloudian_support_comment_key(subject, body):
+    case = re.match(r"(?i)^New Comment\s+\[(\d{1,12})\](?:\s|$)", subject)
+    if not case:
+        return None
+    body = html.unescape(body)
+    support = cloudian_support_body(body)
+    footer = CLOUDIAN_REPLY_FOOTER.search(support)
+    if support == body and not (footer and CLOUDIAN_PORTAL.search(support, footer.end())):
+        return None
+    shift = re.search(r"(?im)^[ \t]*Working Shift:", support[:footer.start()] if footer else support)
+    if not shift:
+        return None
+    comment = re.sub(r"(?is)^\s*\(NOTE\s*-.*?\)\s*", "", support[:shift.start()]).strip()
+    if comment:
+        return comment_fingerprint("support", f"#{case[1]}", comment)
+    return None
 
 
 def cloudian_acknowledgement(body):
@@ -1107,6 +1126,8 @@ def wait_for_next_poll(config, options):
 def mark_handled(database, key, validity, uid):
     database.execute("INSERT OR IGNORE INTO handled VALUES (?, ?, ?)", (key, validity, uid))
     database.execute("DELETE FROM pending WHERE mailbox = ? AND uid = ?", (key, uid))
+    database.execute("DELETE FROM cloudian_fallback WHERE mailbox = ? AND validity = ? AND uid = ?",
+                     (key, validity, uid))
 
 
 def imap_mailbox_identity(settings):
@@ -1134,6 +1155,8 @@ def open_state(config):
             (mailbox TEXT, validity INTEGER, uid INTEGER, PRIMARY KEY (mailbox, validity, uid));
         CREATE TABLE IF NOT EXISTS acknowledgement
             (mailbox TEXT, case_id TEXT, PRIMARY KEY (mailbox, case_id));
+        CREATE TABLE IF NOT EXISTS cloudian_fallback
+            (mailbox TEXT, validity INTEGER, uid INTEGER, PRIMARY KEY (mailbox, validity, uid));
         CREATE TABLE IF NOT EXISTS mail_uid_directory
             (mailbox TEXT, validity INTEGER, uid INTEGER, received INTEGER, subject TEXT,
              PRIMARY KEY (mailbox, validity, uid));
@@ -1303,6 +1326,7 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
         with database:
             database.execute("REPLACE INTO cursor VALUES (?, ?, ?)", (key, validity, start))
             database.execute("DELETE FROM pending WHERE mailbox = ?", (key,))
+            database.execute("DELETE FROM cloudian_fallback WHERE mailbox = ? AND validity != ?", (key, validity))
         logging.info("메일함의 초기 수신 기준을 설정했습니다.")
         if not unread and not include_unread:
             return key, validity, None, {}
@@ -1323,6 +1347,10 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
     ).fetchone()
     if outstanding:
         uids.add(outstanding[0])
+    deferred = set() if retranslate is not None else {uid for uid, in database.execute(
+        "SELECT uid FROM cloudian_fallback WHERE mailbox = ? AND validity = ?", (key, validity),
+    )}
+    uids.update(deferred)
     received = {}
     ordered = sorted(uids)
     for offset in range(0, len(ordered), 200):
@@ -1337,6 +1365,9 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
                 if timestamp is None:
                     raise RuntimeError("IMAP 수신 시각 또는 시간대를 가져오지 못했습니다.")
                 received[int(uid_match[1])] = timestamp
+    with database:
+        database.executemany("DELETE FROM cloudian_fallback WHERE mailbox = ? AND validity = ? AND uid = ?",
+                             ((key, validity, uid) for uid in deferred.difference(received)))
     if outstanding and outstanding[0] not in received:
         # The message can be removed after its delivery payload was saved.
         received[outstanding[0]] = None
@@ -1373,6 +1404,7 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
             raise RuntimeError("선택한 메일이 현재 메일함에 없습니다.")
         earliest = datetime.min.replace(tzinfo=timezone.utc)
         candidates.sort(key=lambda item: (item[0], item[1] or earliest, item[2], item[3]))
+        fallbacks = []
         for _, received, index, uid in candidates:
             if interrupted is not None and interrupted():
                 return
@@ -1380,8 +1412,22 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
             received_text = received.isoformat() if received else "수신 시각 없음"
             logging.info("메일 계정 %s 검사 · %s · 수신 %s",
                          index + 1, settings["imap_user"], received_text)
+            fallback = process_mail(connection, settings, token, codex, database, key, validity, uid,
+                                    destination_keys=destination_keys, received=received, retranslate=retranslate)
+            if fallback is not None:
+                fallbacks.append((index, validity, uid, received, fallback))
+                continue
+            checked(connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)"), "메일 읽음 표시")
+        # Give clean copies in this batch the first chance to supply the alert and reply target.
+        fallback_cutoff = datetime.now(timezone.utc) - CLOUDIAN_COPY_WAIT
+        for index, validity, uid, received, raw in fallbacks:
+            if interrupted is not None and interrupted():
+                return
+            if received and received > fallback_cutoff:
+                continue
+            settings, connection, key, _, _ = mailboxes[index]
             process_mail(connection, settings, token, codex, database, key, validity, uid,
-                         destination_keys=destination_keys, received=received, retranslate=retranslate)
+                         destination_keys=destination_keys, received=received, retranslate=None, fallback_raw=raw)
             checked(connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)"), "메일 읽음 표시")
         if not unread and retranslate is None:
             # A partial batch must remain discoverable even if UID and arrival order differ.
@@ -1395,7 +1441,7 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
 
 
 def process_mail(connection, settings, token, codex, database, key, validity, uid, *,
-                 destination_keys, received, retranslate):
+                 destination_keys, received, retranslate, fallback_raw=None):
     chat_id = settings["telegram_chat_id"]
     if retranslate is None and database.execute(
         "SELECT 1 FROM handled WHERE mailbox = ? AND validity = ? AND uid = ?",
@@ -1416,8 +1462,10 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             payload = {"parts": payload, "ack": None}
     else:
         progress_id = cached.get("progress_id") if preparing else None
-        data = checked(connection.uid("FETCH", str(uid), "(BODY.PEEK[])"), "본문 읽기")
-        raw = next((item[1] for item in data if isinstance(item, tuple)), None)
+        raw = fallback_raw
+        if raw is None:
+            data = checked(connection.uid("FETCH", str(uid), "(BODY.PEEK[])"), "본문 읽기")
+            raw = next((item[1] for item in data if isinstance(item, tuple)), None)
         if raw is None:
             if retranslate is not None:
                 raise RuntimeError("선택한 메일의 본문을 찾지 못했습니다.")
@@ -1437,6 +1485,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         ) if settings.get("smtp_host") else None
         subject = re.sub(r"\s*\[\s*ref:![^\]\r\n]+:ref\s*\]\s*$", "", original_subject, flags=re.IGNORECASE)
         body = clean_cloudian_case_confirmation(subject, body)
+        support_key = cloudian_support_comment_key(subject, body)
+        stamp = CLOUDIAN_STAMP.match(body)
         ack = cloudian_acknowledgement(body)
         if ack:
             case_id = ack[0]
@@ -1447,15 +1497,20 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         body = remove_quoted_mail_headers(clean_cloudian_metadata(body))
         previous_reply = remove_quoted_mail_headers(clean_cloudian_metadata(previous_reply))
         placeholders = ",".join("?" for _ in destination_keys)
-        if retranslate is None and case_id and database.execute(
-            f"SELECT 1 FROM acknowledgement WHERE mailbox IN ({placeholders}) AND case_id = ?",
-            (*destination_keys, case_id),
+        if retranslate is None and (case_id or support_key) and database.execute(
+            f"SELECT 1 FROM acknowledgement WHERE mailbox IN ({placeholders}) AND case_id IN (?, ?)",
+            (*destination_keys, case_id, support_key),
         ).fetchone():
             logging.info("이미 전송한 Cloudian 알림을 건너뜁니다.")
             update_progress(token, chat_id, progress_id, "이미 전달된 Cloudian 알림입니다.")
             with database:
                 mark_handled(database, key, validity, uid)
             return
+        if (retranslate is None and not preparing and fallback_raw is None and support_key
+                and stamp and stamp[1].lower() == "cloudian"):
+            with database:
+                database.execute("INSERT OR IGNORE INTO cloudian_fallback VALUES (?, ?, ?)", (key, validity, uid))
+            return raw
         message = closed_case_notification(subject, body, received, raw)
         if message is None:
             message = case_feedback_notification(subject, raw, received)
@@ -1497,7 +1552,7 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             case_status = None
             if ack:
                 case_status = "엔지니어 답변 예정"
-            elif (case_id or "").startswith("comment:support:"):
+            elif support_key or (case_id or "").startswith("comment:support:"):
                 case_status = "지원팀 댓글"
             elif (case_id or "").startswith("comment:customer:"):
                 case_status = "고객 댓글"
@@ -1520,6 +1575,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             logging.info("메일 재번역 및 전송 완료")
             return
         payload = {"message": message, "ack": case_id, "summary": summary}
+        if support_key:
+            payload["support_key"] = support_key
         if progress_id:
             payload["progress_id"] = progress_id
         if reply_metadata:
@@ -1549,10 +1606,10 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         with database:
             database.execute("UPDATE pending SET sent = ? WHERE mailbox = ?", (index + 1, key))
     with database:
-        if payload["ack"]:
-            database.execute(
-                "INSERT OR IGNORE INTO acknowledgement VALUES (?, ?)", (key, payload["ack"])
-            )
+        database.executemany(
+            "INSERT OR IGNORE INTO acknowledgement VALUES (?, ?)",
+            ((key, fingerprint) for fingerprint in (payload.get("ack"), payload.get("support_key")) if fingerprint),
+        )
         mark_handled(database, key, validity, uid)
     logging.info("메일 전송 완료")
 
