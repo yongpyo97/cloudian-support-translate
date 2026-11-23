@@ -118,13 +118,78 @@ class MailWorker:
         self.events = events
         self.commands = queue.Queue()
         self.interrupt = threading.Event()
+        self.telegram_settings = queue.Queue()
+        self.telegram_stop = threading.Event()
+        self.reply_settings = queue.Queue()
+        self.reply_work = threading.Event()
+        self.telegram_thread = threading.Thread(target=self.run_telegram, name="telegram-worker")
+        self.reply_thread = threading.Thread(target=self.run_telegram_replies, name="telegram-reply-worker")
         self.thread = threading.Thread(target=self.run, name="mail-worker")
+        self.telegram_thread.start()
+        self.reply_thread.start()
         self.thread.start()
 
     def request(self, command, value=None):
         if command in {"apply", "pause", "exit"}:
             self.interrupt.set()
+        if command == "exit":
+            self.telegram_stop.set()
+            self.set_telegram_settings(None)
         self.commands.put((command, value))
+
+    def set_telegram_settings(self, current):
+        self.telegram_settings.put(current)
+        self.reply_settings.put(current)
+        self.reply_work.set()
+
+    def run_telegram_replies(self):
+        current = None
+        with closing(sqlite3.connect(self.config.with_suffix(".sqlite3"))) as database:
+            while not self.telegram_stop.is_set():
+                self.reply_work.wait(1)
+                self.reply_work.clear()
+                try:
+                    while True:
+                        current = self.reply_settings.get_nowait()
+                except queue.Empty:
+                    pass
+                if current is None or self.telegram_stop.is_set():
+                    continue
+                settings, accounts, token, codex = current
+                try:
+                    mailbot_reply.notify_interrupted_sends(self.engine, database, settings, token)
+                    mailbot_reply.process_reply_jobs(
+                        self.engine, database, settings, accounts, token, codex,
+                        interrupted=lambda: self.telegram_stop.is_set() or not self.reply_settings.empty(),
+                    )
+                except NETWORK_ERRORS as error:
+                    logging.warning("Telegram 회신 작업 실패 (%s)", type(error).__name__)
+
+    def run_telegram(self):
+        current = None
+        with closing(sqlite3.connect(self.config.with_suffix(".sqlite3"))) as database:
+            while not self.telegram_stop.is_set():
+                try:
+                    if current is None:
+                        current = self.telegram_settings.get()
+                    while True:
+                        current = self.telegram_settings.get_nowait()
+                except queue.Empty:
+                    pass
+                if current is None or self.telegram_stop.is_set():
+                    continue
+                try:
+                    mailbot_reply.check_updates(
+                        self.engine, database, *current,
+                        interrupted=lambda: self.telegram_stop.is_set() or not self.telegram_settings.empty(),
+                        wake_replies=self.reply_work.set,
+                    )
+                except NETWORK_ERRORS as error:
+                    logging.warning("Telegram 업데이트 확인 실패 (%s)", type(error).__name__)
+                    try:
+                        current = self.telegram_settings.get(timeout=3)
+                    except queue.Empty:
+                        pass
 
     def run(self):
         try:
@@ -135,6 +200,8 @@ class MailWorker:
             self.events.put(("worker-status", "처리 기록 오류"))
             return
         try:
+            with database:
+                database.execute("UPDATE reply_drafts SET status='interrupted' WHERE status='sending'")
             self.loop(database)
         finally:
             database.close()
@@ -146,15 +213,14 @@ class MailWorker:
         paused = False
         first_checks = set()
         previous = None
-        mail_due = reply_due = None
-        reply_accounts = {}
+        mail_due = None
+        telegram_settings = None
         while True:
-            deadlines = [deadline for deadline in (mail_due, reply_due) if deadline is not None]
-            delay = max(0, min(deadlines) - time.monotonic()) if deadlines else None
+            delay = max(0, mail_due - time.monotonic()) if mail_due is not None else None
             try:
                 command, value = self.commands.get(timeout=delay)
             except queue.Empty:
-                command = "replies" if reply_due is not None and (mail_due is None or reply_due <= mail_due) else "poll"
+                command = "poll"
                 value = None
             if command == "exit":
                 return
@@ -177,28 +243,22 @@ class MailWorker:
                 }
                 self.interrupt.clear()
                 mail_due = None if paused else time.monotonic()
-                reply_due = mail_due
+                telegram_settings = (settings, reply_accounts, token, codex)
+                self.set_telegram_settings(None if paused else telegram_settings)
                 self.events.put(("worker-status", "일시정지" if paused else "메일 확인 대기"))
                 continue
             if command == "pause":
                 paused = True
-                mail_due = reply_due = None
+                mail_due = None
+                self.set_telegram_settings(None)
                 self.events.put(("worker-status", "일시정지"))
                 continue
             if command == "resume":
                 paused = False
                 self.interrupt.clear()
                 mail_due = time.monotonic() if settings else None
-                reply_due = mail_due
+                self.set_telegram_settings(telegram_settings)
                 self.events.put(("worker-status", "메일 확인 대기" if settings else "설정 필요"))
-                continue
-            if command == "replies":
-                try:
-                    mailbot_reply.check_updates(self.engine, database, settings, reply_accounts, token, codex)
-                    reply_due = time.monotonic() + 4
-                except NETWORK_ERRORS as error:
-                    logging.warning("Telegram 회신 확인 실패 (%s)", type(error).__name__)
-                    reply_due = time.monotonic() + 30
                 continue
             if not settings or (paused and command == "poll"):
                 continue
@@ -213,6 +273,22 @@ class MailWorker:
                     self.engine.poll(settings | account, passwords[value[0]], token, codex, database,
                                      retranslate=value[1], retranslate_validity=value[2], interactive=True)
                 else:
+                    for account in accounts:
+                        if self.interrupt.is_set():
+                            break
+                        account_settings = settings | account
+                        key = self.engine.mailbox_key(account_settings)
+                        jobs = database.execute(
+                            "SELECT uid, validity FROM manual_retranslation WHERE mailbox = ? ORDER BY rowid", (key,),
+                        ).fetchall()
+                        for uid, validity in jobs:
+                            if self.interrupt.is_set():
+                                break
+                            try:
+                                self.engine.poll(account_settings, passwords[account_key(account)], token, codex, database,
+                                                 retranslate=uid, retranslate_validity=validity, interactive=True)
+                            except NETWORK_ERRORS as error:
+                                logging.warning("저장된 메일 재번역 확인 실패 (%s)", type(error).__name__)
                     self.engine.poll_accounts([
                         (settings | account, passwords[account_key(account)], account_key(account) in first_checks)
                         for account in accounts
@@ -1954,6 +2030,14 @@ class Window:
             if self.busy or self.closing or not self.running:
                 status.configure(text="먼저 연결 설정을 적용한 뒤 재번역할 수 있습니다.")
                 return
+            try:
+                key = self.engine.mailbox_key(self.settings | account)
+                with closing(sqlite3.connect(self.config.with_suffix(".sqlite3"), timeout=1)) as database, database:
+                    database.execute("INSERT OR IGNORE INTO manual_retranslation VALUES (?, ?, ?, NULL)",
+                                     (key, uid, validity))
+            except sqlite3.Error:
+                status.configure(text="재번역 요청을 저장하지 못했습니다. 잠시 후 다시 시도하세요.")
+                return
             self.worker.request("retranslate", (account_key(account), uid, validity))
             self.notice.set(f"메일 UID {uid} 재번역을 요청했습니다.")
             dialog.destroy()
@@ -2002,7 +2086,7 @@ class Window:
         self.finish_exit()
 
     def finish_exit(self):
-        if self.worker.thread.is_alive():
+        if any(thread.is_alive() for thread in (self.worker.thread, self.worker.telegram_thread, self.worker.reply_thread)):
             self.root.after(150, self.finish_exit)
             return
         self.tray.stop()
@@ -2115,9 +2199,10 @@ def run(engine, config, *, hidden=False):
         try:
             root.mainloop()
         finally:
-            if window.worker.thread.is_alive():
-                window.worker.request("exit")
-                window.worker.thread.join()
+            window.worker.request("exit")
+            window.worker.thread.join()
+            window.worker.telegram_thread.join()
+            window.worker.reply_thread.join()
             window.tray.stop()
         logging.info("%s 종료", APP_NAME)
     return 0

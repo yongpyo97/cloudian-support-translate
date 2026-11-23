@@ -35,7 +35,7 @@ import truststore
 import mailbot_reply
 
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.7"
 
 
 class MailText(HTMLParser):
@@ -112,6 +112,15 @@ CLOUDIAN_STAMP = re.compile(
 CLOUDIAN_REPLY_FOOTER = re.compile(
     r"(?im)^\s*You may reply to this email directly but please DO NOT change the subject\."
 )
+CLOUDIAN_REPLY_NOTICE = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"\(NOTE\s*-\s*You may reply to this email directly but please DO NOT change the subject\.\s+"
+    r"This email content will be copied into a Case Comment and then emailed to other stakeholders\s+as well as you\.\)"
+    r"|You may reply directly to this email\.\s+Keep the original email subject\.\s+"
+    r"Your reply will be recorded in a Case Comment and emailed to stakeholders\."
+    r"|You may reply to this email directly but please DO NOT change(?:[ \t]+the subject\.)?"
+    r")[ \t]*$"
+)
 CLOUDIAN_COPY_WAIT = timedelta(seconds=30)
 QUOTED_HEADER = re.compile(
     r"(?im)^[ \t>\\]*\*{0,2}(from|sent|date|to|cc|bcc|subject|"
@@ -169,6 +178,10 @@ def cloudian_support_body(body):
         if separator:
             return remainder[separator.end():].lstrip()
     return body
+
+
+def remove_cloudian_reply_notice(body):
+    return compact_mail_text(CLOUDIAN_REPLY_NOTICE.sub("", body))
 
 
 def clean_cloudian_metadata(body):
@@ -246,11 +259,7 @@ def cloudian_comment(body):
             comment = re.sub(r"(?is)^\s*\(NOTE\s*-.*?\)\s*", "", body[:footer.start()]).strip()
             if comment:
                 key = comment_fingerprint("support", portal[1], comment)
-                guidance = (
-                    "You may reply directly to this email. Keep the original email subject. "
-                    "Your reply will be recorded in a Case Comment and emailed to stakeholders."
-                )
-                return f"Cloudian Support case comment\n\n{comment}\n\n{guidance}\n\nCase link\n{portal[0]}", key, ""
+                return f"Cloudian Support case comment\n\n{comment}\n\nCase link\n{portal[0]}", key, ""
     return body, None, ""
 
 
@@ -508,8 +517,10 @@ def update_progress(token, chat_id, message_id, text, *, caption=False, clear_bu
     return True
 
 
-def publish_progress(token, chat_id, text, *, progress_id=None, document=None, reply_markup=None):
+def publish_progress(token, chat_id, text, *, progress_id=None, document=None, reply_markup=None, entities=None):
     kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
+    if entities is not None:
+        kwargs["entities"] = entities
     if document is not None and "reply_markup" in kwargs:
         kwargs["reply_markup"] = json.dumps(reply_markup)
     if progress_id:
@@ -715,11 +726,19 @@ def send_mail(database, token, chat_id, uid, message, report="", *, summary="", 
         report = report.splitlines()[0]
         message += f"\n\n{report}"
     fits = len(message.encode("utf-16-le")) // 2 <= 4096
+    if preview_enabled and fits:
+        heading, separator, body = message.partition("\n\n")
+        entity = {
+            "type": "expandable_blockquote",
+            "offset": len((heading + separator).encode("utf-16-le")) // 2,
+            "length": len(body.encode("utf-16-le")) // 2,
+        }
+        return publish_progress(token, chat_id, message, progress_id=progress_id, entities=[entity])
     if preview_enabled:
         heading = (summary or message.split("\n\n", 1)[0])[:1000]
-        filename = None if fits else attachment_filename(uid, summary or heading)
+        filename = attachment_filename(uid, summary or heading)
         result = publish_progress(token, chat_id, heading, progress_id=progress_id,
-                                  reply_markup=mail_preview_keyboard("file" if filename else "open"))
+                                  reply_markup=mail_preview_keyboard("file"))
         with database:
             database.execute(
                 "INSERT OR REPLACE INTO mail_previews VALUES (?, ?, ?, ?, ?, ?, NULL)",
@@ -744,6 +763,13 @@ def checked(result, action):
     if status != "OK":
         raise RuntimeError(f"IMAP {action} 실패")
     return data
+
+
+def mail_uid(connection, action, *args):
+    try:
+        return checked(connection.uid(*args), action)
+    except (OSError, RuntimeError, imaplib.IMAP4.error) as error:
+        raise MailboxOperationError(f"IMAP {action} 실패 ({type(error).__name__})") from error
 
 
 def mailbox_number(connection, name):
@@ -1204,7 +1230,17 @@ def wait_for_next_poll(config, options):
         time.sleep(min(2, remaining))
 
 
+class MailBodyUnavailable(RuntimeError):
+    pass
+
+
+class MailboxOperationError(RuntimeError):
+    pass
+
+
 def mark_handled(database, key, validity, uid):
+    database.execute("DELETE FROM mail_body_retry WHERE mailbox = ? AND validity = ? AND uid = ?",
+                     (key, validity, uid))
     database.execute("INSERT OR IGNORE INTO handled VALUES (?, ?, ?)", (key, validity, uid))
     database.execute("DELETE FROM pending WHERE mailbox = ? AND uid = ?", (key, uid))
     database.execute("DELETE FROM cloudian_fallback WHERE mailbox = ? AND validity = ? AND uid = ?",
@@ -1232,6 +1268,12 @@ def open_state(config):
     database.executescript("""
         CREATE TABLE IF NOT EXISTS cursor (mailbox TEXT PRIMARY KEY, validity INTEGER, uid INTEGER);
         CREATE TABLE IF NOT EXISTS pending (mailbox TEXT PRIMARY KEY, uid INTEGER, parts TEXT, sent INTEGER);
+        CREATE TABLE IF NOT EXISTS mail_body_retry
+            (mailbox TEXT, validity INTEGER, uid INTEGER, PRIMARY KEY (mailbox, validity, uid));
+        CREATE TABLE IF NOT EXISTS manual_retranslation (
+            mailbox TEXT, uid INTEGER, validity INTEGER, payload TEXT,
+            PRIMARY KEY (mailbox, uid)
+        );
         CREATE TABLE IF NOT EXISTS handled
             (mailbox TEXT, validity INTEGER, uid INTEGER, PRIMARY KEY (mailbox, validity, uid));
         CREATE TABLE IF NOT EXISTS acknowledgement
@@ -1406,6 +1448,7 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
             database.execute("REPLACE INTO cursor VALUES (?, ?, ?)", (key, validity, start))
             database.execute("DELETE FROM pending WHERE mailbox = ?", (key,))
             database.execute("DELETE FROM cloudian_fallback WHERE mailbox = ? AND validity != ?", (key, validity))
+            database.execute("DELETE FROM mail_body_retry WHERE mailbox = ? AND validity != ?", (key, validity))
         logging.info("메일함의 초기 수신 기준을 설정했습니다.")
         if not unread and not include_unread:
             return key, validity, None, {}
@@ -1430,6 +1473,10 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
         "SELECT uid FROM cloudian_fallback WHERE mailbox = ? AND validity = ?", (key, validity),
     )}
     uids.update(deferred)
+    if retranslate is None:
+        uids.update(uid for uid, in database.execute(
+            "SELECT uid FROM mail_body_retry WHERE mailbox = ? AND validity = ?", (key, validity),
+        ))
     received = {}
     ordered = sorted(uids)
     for offset in range(0, len(ordered), 200):
@@ -1462,63 +1509,111 @@ def poll(settings, password, token, codex, database, *, unread=False, include_un
 
 def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate=None,
                   retranslate_validity=None, interrupted=None, interactive=False):
+    accounts = tuple(accounts)
     with ExitStack() as stack:
         mailboxes = []
         candidates = []
+        account_errors = []
+        failed_keys = set()
+        destination_keys = tuple(mailbox_key(settings) for settings, _, _ in accounts)
         for settings, password, include_unread in accounts:
             if interrupted is not None and interrupted():
                 return
-            connection = open_mailbox(stack, settings, password, readonly=False)
-            key, validity, pending_uid, received = mailbox_candidates(
-                connection, settings, database, unread=unread,
-                include_unread=include_unread, retranslate=retranslate,
-            )
+            try:
+                with ExitStack() as mailbox_stack:
+                    connection = open_mailbox(mailbox_stack, settings, password, readonly=False)
+                    key, validity, pending_uid, received = mailbox_candidates(
+                        connection, settings, database, unread=unread,
+                        include_unread=include_unread, retranslate=retranslate,
+                    )
+                    stack.enter_context(mailbox_stack.pop_all())
+            except (OSError, RuntimeError, imaplib.IMAP4.error) as error:
+                if retranslate is not None:
+                    raise
+                account_errors.append(error)
+                continue
             if retranslate_validity is not None and validity != retranslate_validity:
+                if interactive:
+                    clear_manual_retranslation(database, key, retranslate, token, settings["telegram_chat_id"])
                 raise RuntimeError("메일함이 변경되어 선택한 메일을 다시 조회해야 합니다.")
+            if interactive and retranslate is not None:
+                with database:
+                    database.execute("INSERT OR IGNORE INTO manual_retranslation VALUES (?, ?, ?, NULL)",
+                                     (key, retranslate, validity))
+                    database.execute("UPDATE manual_retranslation SET validity = ? WHERE mailbox = ? AND uid = ?",
+                                     (validity, key, retranslate))
             index = len(mailboxes)
             mailboxes.append((settings, connection, key, validity, received))
             candidates.extend((uid != pending_uid, timestamp, index, uid) for uid, timestamp in received.items())
-        destination_keys = tuple(mailbox[2] for mailbox in mailboxes)
         if retranslate is not None and not candidates:
+            if interactive:
+                for settings, _, key, _, _ in mailboxes:
+                    clear_manual_retranslation(database, key, retranslate, token, settings["telegram_chat_id"])
             raise RuntimeError("선택한 메일이 현재 메일함에 없습니다.")
         earliest = datetime.min.replace(tzinfo=timezone.utc)
         candidates.sort(key=lambda item: (item[0], item[1] or earliest, item[2], item[3]))
+        def deliver(index, uid, received, *, fallback_raw=None):
+            settings, connection, key, validity, _ = mailboxes[index]
+            try:
+                fallback = process_mail(connection, settings, token, codex, database, key, validity, uid,
+                                        destination_keys=destination_keys, received=received, retranslate=retranslate,
+                                        fallback_raw=fallback_raw, interactive=interactive)
+                if fallback is None:
+                    mail_uid(connection, "메일 읽음 표시", "STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)")
+                return fallback
+            except (MailBodyUnavailable, MailboxOperationError) as error:
+                if retranslate is not None:
+                    raise
+                with database:
+                    database.execute("INSERT OR IGNORE INTO mail_body_retry VALUES (?, ?, ?)", (key, validity, uid))
+                if isinstance(error, MailboxOperationError):
+                    failed_keys.add(key)
+                    account_errors.append(error)
+                else:
+                    logging.warning("메일 본문을 받지 못했습니다. 다음 확인 때 다시 시도합니다.")
+                return None
+
         fallbacks = []
         for _, received, index, uid in candidates:
             if interrupted is not None and interrupted():
                 return
-            settings, connection, key, validity, _ = mailboxes[index]
+            settings, _, key, _, _ = mailboxes[index]
+            if key in failed_keys:
+                continue
             received_text = received.isoformat() if received else "수신 시각 없음"
             logging.info("메일 계정 %s 검사 · %s · 수신 %s",
                          index + 1, settings["imap_user"], received_text)
-            fallback = process_mail(connection, settings, token, codex, database, key, validity, uid,
-                                    destination_keys=destination_keys, received=received, retranslate=retranslate,
-                                    interactive=interactive)
+            fallback = deliver(index, uid, received)
             if fallback is not None:
-                fallbacks.append((index, validity, uid, received, fallback))
-                continue
-            checked(connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)"), "메일 읽음 표시")
+                fallbacks.append((index, uid, received, fallback))
         # Give clean copies in this batch the first chance to supply the alert and reply target.
         fallback_cutoff = datetime.now(timezone.utc) - CLOUDIAN_COPY_WAIT
-        for index, validity, uid, received, raw in fallbacks:
+        for index, uid, received, raw in fallbacks:
             if interrupted is not None and interrupted():
                 return
-            if received and received > fallback_cutoff:
+            if mailboxes[index][2] in failed_keys or (received and received > fallback_cutoff):
                 continue
-            settings, connection, key, _, _ = mailboxes[index]
-            process_mail(connection, settings, token, codex, database, key, validity, uid,
-                         destination_keys=destination_keys, received=received, retranslate=None, fallback_raw=raw,
-                         interactive=interactive)
-            checked(connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)"), "메일 읽음 표시")
+            deliver(index, uid, received, fallback_raw=raw)
         if not unread and retranslate is None:
             # A partial batch must remain discoverable even if UID and arrival order differ.
             with database:
                 for _, _, key, validity, received in mailboxes:
-                    if received:
+                    if received and key not in failed_keys:
                         database.execute(
                             "UPDATE cursor SET uid = MAX(uid, ?) WHERE mailbox = ? AND validity = ?",
                             (max(received), key, validity),
                         )
+        if account_errors:
+            raise account_errors[0]
+
+
+def clear_manual_retranslation(database, key, uid, token, chat_id):
+    with database:
+        row = database.execute("DELETE FROM manual_retranslation WHERE mailbox = ? AND uid = ? RETURNING payload",
+                               (key, uid)).fetchone()
+    if row and row[0]:
+        progress_id = json.loads(row[0]).get("progress_id")
+        update_progress(token, chat_id, progress_id, "원본 메일을 찾을 수 없어 재번역을 중지했습니다.")
 
 
 def process_mail(connection, settings, token, codex, database, key, validity, uid, *,
@@ -1532,9 +1627,15 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         with database:
             mark_handled(database, key, validity, uid)
         return
-    pending = None if retranslate is not None else database.execute(
-        "SELECT uid, parts, sent FROM pending WHERE mailbox = ?", (key,)
-    ).fetchone()
+    manual = interactive and retranslate is not None
+    pending = None
+    if manual:
+        pending = database.execute(
+            "SELECT uid, payload, 0 FROM manual_retranslation WHERE mailbox = ? AND uid = ? AND payload IS NOT NULL",
+            (key, uid),
+        ).fetchone()
+    elif retranslate is None:
+        pending = database.execute("SELECT uid, parts, sent FROM pending WHERE mailbox = ?", (key,)).fetchone()
     cached = json.loads(pending[1]) if pending and pending[0] == uid else None
     preparing = isinstance(cached, dict) and cached.get("preparing")
     if cached is not None and not preparing:
@@ -1545,17 +1646,15 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         progress_id = cached.get("progress_id") if preparing else None
         raw = fallback_raw
         if raw is None:
-            data = checked(connection.uid("FETCH", str(uid), "(BODY.PEEK[])"), "본문 읽기")
+            data = mail_uid(connection, "본문 읽기", "FETCH", str(uid), "(BODY.PEEK[])")
             raw = next((item[1] for item in data if isinstance(item, tuple)), None)
         if raw is None:
-            if retranslate is not None:
-                raise RuntimeError("선택한 메일의 본문을 찾지 못했습니다.")
-            if preparing:
+            if not received and preparing and retranslate is None:
                 update_progress(token, chat_id, progress_id, "메일이 메일함에 없어 번역을 중지했습니다.")
                 with database:
                     database.execute("DELETE FROM pending WHERE mailbox = ? AND uid = ?", (key, uid))
-            logging.warning("메일 본문을 가져오지 못했습니다.")
-            return
+                return
+            raise MailBodyUnavailable("메일 본문을 가져오지 못했습니다. 다음 확인 때 다시 시도합니다.")
         original_subject, body = mail_content(raw)
         remember_mail_uids(database, settings, [
             (uid, validity, int(received.timestamp()) if received else 0, uid_subject(original_subject)),
@@ -1573,8 +1672,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             body, _, _ = cloudian_comment(body)
         else:
             body, case_id, previous_reply = cloudian_comment(body)
-        body = remove_quoted_mail_headers(clean_cloudian_metadata(body))
-        previous_reply = remove_quoted_mail_headers(clean_cloudian_metadata(previous_reply))
+        body = remove_cloudian_reply_notice(remove_quoted_mail_headers(clean_cloudian_metadata(body)))
+        previous_reply = remove_cloudian_reply_notice(remove_quoted_mail_headers(clean_cloudian_metadata(previous_reply)))
         placeholders = ",".join("?" for _ in destination_keys)
         if retranslate is None and (case_id or support_key) and database.execute(
             f"SELECT 1 FROM acknowledgement WHERE mailbox IN ({placeholders}) AND case_id IN (?, ?)",
@@ -1611,22 +1710,25 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             else:
                 progress_text = "메일을 다시 번역하는 중입니다…" if retranslate is not None else "새 메일을 번역하는 중입니다…"
                 progress_id = post_progress(token, chat_id, progress_text)
-                if progress_id and retranslate is None:
+                if progress_id:
+                    draft = json.dumps({"preparing": True, "progress_id": progress_id})
                     with database:
-                        database.execute("REPLACE INTO pending VALUES (?, ?, ?, 0)", (
-                            key, uid, json.dumps({"preparing": True, "progress_id": progress_id}),
-                        ))
+                        if manual:
+                            database.execute("UPDATE manual_retranslation SET payload = ? WHERE mailbox = ? AND uid = ?",
+                                             (draft, key, uid))
+                        elif retranslate is None:
+                            database.execute("REPLACE INTO pending VALUES (?, ?, ?, 0)", (key, uid, draft))
             try:
                 translation = translate(
                     codex, subject, body, language, previous_reply=previous_reply, model=model,
                     custom_prompt=custom_prompt, body_only=True,
                 )
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
-                status = ("메일 번역에 실패했습니다. 다음 확인 때 다시 시도합니다." if retranslate is None
+                status = ("메일 번역에 실패했습니다. 다음 확인 때 다시 시도합니다." if retranslate is None or manual
                           else "메일 재번역에 실패했습니다. 앱 로그에서 원인을 확인하세요.")
                 update_progress(token, chat_id, progress_id, status)
                 raise
-            translation = remove_quoted_mail_headers(translation)
+            translation = remove_cloudian_reply_notice(remove_quoted_mail_headers(translation))
             logging.info("메일 번역 완료")
             case_status = None
             if ack:
@@ -1642,17 +1744,6 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
                 received=received, case_status=case_status,
             )
         summary = message.split("\n\n", 1)[0]
-        if retranslate is not None:
-            try:
-                result = send_mail(database, token, chat_id, uid, message, summary=summary,
-                                   reply_enabled=bool(reply_metadata), progress_id=progress_id, interactive=interactive)
-            except (OSError, RuntimeError):
-                update_progress(token, chat_id, progress_id, "텔레그램에서 재번역 결과의 전달 여부를 확인하지 못했습니다.")
-                raise
-            with database:
-                mailbot_reply.remember_target(database, token, chat_id, key, result, reply_metadata)
-            logging.info("메일 재번역 및 전송 완료")
-            return
         payload = {"message": message, "ack": case_id, "summary": summary}
         if support_key:
             payload["support_key"] = support_key
@@ -1662,10 +1753,22 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             payload["reply"] = reply_metadata
         sent = 0
         with database:
-            database.execute(
-                "REPLACE INTO pending VALUES (?, ?, ?, ?)", (key, uid, json.dumps(payload), sent)
-            )
+            if manual:
+                database.execute("UPDATE manual_retranslation SET payload = ? WHERE mailbox = ? AND uid = ?",
+                                 (json.dumps(payload), key, uid))
+            elif retranslate is None:
+                database.execute("REPLACE INTO pending VALUES (?, ?, ?, ?)", (key, uid, json.dumps(payload), sent))
     reply_metadata = payload.get("reply")
+    if retranslate is not None:
+        result = send_mail(database, token, chat_id, uid, payload["message"], summary=payload["summary"],
+                           reply_enabled=bool(reply_metadata), progress_id=payload.get("progress_id"),
+                           interactive=interactive)
+        with database:
+            mailbot_reply.remember_target(database, token, chat_id, key, result, reply_metadata)
+            if manual:
+                database.execute("DELETE FROM manual_retranslation WHERE mailbox = ? AND uid = ?", (key, uid))
+        logging.info("메일 재번역 및 전송 완료")
+        return
     if "message" in payload and sent == 0:
         result = send_mail(database, token, chat_id, uid, payload["message"],
                            payload.get("report", ""), summary=payload.get("summary", ""),

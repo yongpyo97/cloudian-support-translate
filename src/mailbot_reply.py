@@ -1,4 +1,5 @@
 import hashlib
+import imaplib
 import json
 import logging
 import re
@@ -16,6 +17,10 @@ from subprocess import TimeoutExpired
 
 
 REPLY_MODEL = "gpt-5.6-sol"
+CLOUDIAN_CASE_SUBJECT = re.compile(
+    r"^(?:re\s*:\s*)?New (?:Case|Comment)\s+\[\d+\].*\[\s*(ref:![^\]\r\n]+:ref)\s*\]\s*$",
+    re.IGNORECASE,
+)
 
 
 def scope_for(token):
@@ -38,6 +43,10 @@ def initialize(database):
         );
         CREATE UNIQUE INDEX IF NOT EXISTS reply_preview ON reply_drafts(scope, chat, preview);
         CREATE TABLE IF NOT EXISTS reply_offsets (scope TEXT PRIMARY KEY, next_update INTEGER);
+        CREATE TABLE IF NOT EXISTS telegram_reply_jobs (
+            scope TEXT, chat INTEGER, update_id INTEGER, payload TEXT,
+            PRIMARY KEY (scope, chat, update_id)
+        );
         CREATE TABLE IF NOT EXISTS reply_edit_sessions (
             scope TEXT, chat INTEGER, author INTEGER, draft TEXT, prompt INTEGER, expires REAL,
             PRIMARY KEY (scope, chat, author)
@@ -94,6 +103,23 @@ def compose_reply(body, *, reply_greeting, reply_signature):
     return body
 
 
+def reply_subject(subject):
+    if re.match(r"(?i)^re\s*:", subject):
+        return subject
+    if CLOUDIAN_CASE_SUBJECT.match(subject):
+        return f"RE: {subject}"
+    if re.search(r"(?i)\[\s*ref:![^\]\r\n]+:ref\s*\]", subject):
+        return subject
+    return f"Re: {subject}" if subject else "Re: (제목 없음)"
+
+
+def add_case_reference(subject, body):
+    case = CLOUDIAN_CASE_SUBJECT.match(subject)
+    if case and case[1] not in body:
+        return f"{body.rstrip()}\n\n{case[1]}"
+    return body
+
+
 def target_metadata(raw, body):
     message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
     subject = str(message.get("Subject", "")).strip()
@@ -112,8 +138,7 @@ def target_metadata(raw, body):
             or re.search(r"[\x00-\x1f\x7f]", recipient)
             or re.fullmatch(r"(?i)(?:do[._-]?not[._-]?reply|no[._-]?reply)(?:[+._-].*)?", address.username)):
         return None
-    if not re.search(r"(?i)\[\s*ref:![^\]\r\n]+:ref\s*\]", subject) and not re.match(r"(?i)^re\s*:", subject):
-        subject = f"Re: {subject}" if subject else "Re: (제목 없음)"
+    subject = reply_subject(subject)
     message_id = str(message.get("Message-ID", "")).strip()
     if not re.fullmatch(r"<[^\s<>]+@[^\s<>]+>", message_id):
         message_id = ""
@@ -149,11 +174,11 @@ def verify_smtp(account, password):
         raise RuntimeError(f"SMTP 로그인 실패 · {account['imap_user']} · {type(error).__name__}") from None
 
 
-def send_smtp(account, password, metadata, body, message_id):
+def make_reply_message(account, metadata, body, message_id):
     message = EmailMessage(policy=policy.SMTP)
     message["From"] = account["imap_user"]
     message["To"] = metadata["recipient"]
-    message["Subject"] = metadata["subject"]
+    message["Subject"] = reply_subject(metadata["subject"])
     message["Date"] = formatdate(localtime=True)
     message["Message-ID"] = message_id
     if metadata["in_reply_to"]:
@@ -161,13 +186,17 @@ def send_smtp(account, password, metadata, body, message_id):
     references = list(dict.fromkeys(ref for ref in [*metadata["references"], metadata["in_reply_to"]] if ref))
     if references:
         message["References"] = " ".join(references)
-    message.set_content(body)
+    message.set_content(add_case_reference(metadata["subject"], body))
+    return message
+
+
+def send_smtp(account, password, message, recipient):
     try:
         connection = smtp_login(account, password)
     except (OSError, smtplib.SMTPException) as error:
         return "failed", type(error).__name__
     try:
-        connection.send_message(message, from_addr=account["imap_user"], to_addrs=[metadata["recipient"]])
+        connection.send_message(message, from_addr=account["imap_user"], to_addrs=[recipient])
         return "sent", ""
     except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
         return "failed", type(error).__name__
@@ -178,23 +207,119 @@ def send_smtp(account, password, metadata, body, message_id):
             connection.close()
 
 
-def check_updates(engine, database, settings, accounts, token, codex):
+def find_sent_folder(entries):
+    listed = {}
+    for entry in entries:
+        line = entry[0] if isinstance(entry, tuple) else entry
+        if not isinstance(line, bytes):
+            continue
+        match = re.fullmatch(rb'\(([^)]*)\) (?:NIL|"(?:\\.|[^"\\])*") (.+)', line)
+        if not match:
+            continue
+        flags, folder = match.groups()
+        attributes = flags.lower().split()
+        if b"\\noselect" in attributes or b"\\nonexistent" in attributes:
+            continue
+        if isinstance(entry, tuple):
+            literal = entry[1]
+            if b"\r" in literal or b"\n" in literal:
+                continue
+            folder = b'"' + literal.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+        if b"\\sent" in attributes:
+            return folder
+        listed[folder.strip(b'"').lower()] = folder
+    for name in (b"sent", b"sent items", b"sent messages"):
+        if name in listed:
+            return listed[name]
+    raise RuntimeError("SentFolderMissing")
+
+
+def save_sent_copy(account, password, message, recipient):
+    with imaplib.IMAP4_SSL(
+        account["imap_host"], account.get("imap_port", 993), timeout=20, ssl_context=ssl.create_default_context(),
+    ) as connection:
+        connection.login(account["imap_user"], password)
+        status, entries = connection.list()
+        if status != "OK":
+            raise RuntimeError("SentFolderListFailed")
+        folder = find_sent_folder(entries)
+        mail_policy = policy.SMTP if account["imap_user"].isascii() and recipient.isascii() else policy.SMTPUTF8
+        status, _ = connection.append(folder, r"\Seen", None, message.as_bytes(policy=mail_policy))
+        if status != "OK":
+            raise RuntimeError("SentCopyAppendRejected")
+
+
+def check_updates(engine, database, settings, accounts, token, codex, *, interrupted=None, wake_replies=None):
     chat = int(settings["telegram_chat_id"])
     scope = scope_for(token)
     offset = database.execute("SELECT next_update FROM reply_offsets WHERE scope = ?", (scope,)).fetchone()
     updates = engine.telegram(token, "getUpdates", quiet=True, offset=offset[0] if offset else 0,
-                              timeout=0, limit=20, allowed_updates=["message", "callback_query", "my_chat_member"])
+                              timeout=8, request_timeout=12, limit=20,
+                              allowed_updates=["message", "callback_query", "my_chat_member"])
     for update in updates:
-        try:
-            handle_update(engine, database, scope, chat, accounts, token, codex, settings, update)
-        except (OSError, RuntimeError, ValueError) as error:
-            logging.warning("Telegram 회신 처리 실패 (%s)", type(error).__name__)
-            if not update.get("my_chat_member"):
-                with suppress(OSError, RuntimeError):
-                    engine.telegram(token, "sendMessage", chat_id=chat,
-                                    text="회신 요청을 처리하지 못했습니다. 로그를 확인하세요.")
+        if interrupted and interrupted():
+            return
+        action = (update.get("callback_query") or {}).get("data", "")
+        queued = wake_replies is not None and action not in {"mailview:open", "mailview:close", "mailview:file"}
+        if not queued:
+            process_update(engine, database, scope, chat, accounts, token, codex, settings, update)
         with database:
+            if queued:
+                database.execute("INSERT OR IGNORE INTO telegram_reply_jobs VALUES (?, ?, ?, ?)",
+                                 (scope, chat, update["update_id"], json.dumps(update)))
             database.execute("REPLACE INTO reply_offsets VALUES (?, ?)", (scope, update["update_id"] + 1))
+        if queued:
+            wake_replies()
+
+
+def process_update(engine, database, scope, chat, accounts, token, codex, settings, update):
+    try:
+        handle_update(engine, database, scope, chat, accounts, token, codex, settings, update)
+    except (OSError, RuntimeError, ValueError) as error:
+        logging.warning("Telegram 요청 처리 실패 (%s)", type(error).__name__)
+        if not update.get("my_chat_member"):
+            with suppress(OSError, RuntimeError):
+                engine.telegram(token, "sendMessage", chat_id=chat,
+                                text="Telegram 요청을 처리하지 못했습니다. 로그를 확인하세요.")
+
+
+def process_reply_jobs(engine, database, settings, accounts, token, codex, *, interrupted):
+    scope, chat = scope_for(token), int(settings["telegram_chat_id"])
+    jobs = database.execute(
+        "SELECT update_id, payload FROM telegram_reply_jobs WHERE scope=? AND chat=? ORDER BY update_id", (scope, chat),
+    ).fetchall()
+    for update_id, payload in jobs:
+        if interrupted():
+            return
+        process_update(engine, database, scope, chat, accounts, token, codex, settings, json.loads(payload))
+        with database:
+            database.execute("DELETE FROM telegram_reply_jobs WHERE scope=? AND chat=? AND update_id=?",
+                             (scope, chat, update_id))
+
+
+INTERRUPTED_SEND_NOTICE = (
+    "⚠️ 발송 상태 확인 필요\n"
+    "앱이 종료돼 SMTP 접수 여부를 확인하지 못했습니다. 자동 재발송은 하지 않습니다."
+)
+
+
+def clear_draft_buttons(engine, token, chat, preview):
+    if preview:
+        with suppress(OSError, RuntimeError):
+            engine.telegram(token, "editMessageReplyMarkup", chat_id=chat, message_id=preview,
+                            quiet=True, request_timeout=5, reply_markup={"inline_keyboard": []})
+
+
+def notify_interrupted_sends(engine, database, settings, token):
+    scope, chat = scope_for(token), int(settings["telegram_chat_id"])
+    rows = database.execute(
+        "SELECT id, preview FROM reply_drafts WHERE scope=? AND chat=? AND status='interrupted'", (scope, chat),
+    ).fetchall()
+    for draft, preview in rows:
+        clear_draft_buttons(engine, token, chat, preview)
+        if engine.post_progress(token, chat, INTERRUPTED_SEND_NOTICE, reply_to=preview):
+            with database:
+                database.execute("UPDATE reply_drafts SET status='uncertain' WHERE id=?", (draft,))
 
 
 def remember_chat(database, scope, chat):
@@ -340,6 +465,7 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         engine.telegram(token, "sendMessage", chat_id=chat, text="회신 초안은 2,300자 이하로 입력하세요.")
         return
     metadata = json.loads(row[1])
+    metadata["subject"] = reply_subject(metadata["subject"])
     account, _ = accounts[row[0]]
     progress_text = "수정한 회신으로 새 초안을 만드는 중입니다…" if revised else "회신 초안을 만드는 중입니다…"
     progress_id = engine.post_progress(token, chat, progress_text, reply_to=message.get("message_id"))
@@ -351,6 +477,7 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         if not engine.update_progress(token, chat, progress_id, notice):
             engine.telegram(token, "sendMessage", chat_id=chat, text=notice)
         return
+    preview_body = add_case_reference(metadata["subject"], preview_body)
     heading = (f"메일 회신 초안\n보내는 사람: {account['imap_user']}\n받는 사람: {metadata['recipient']}\n"
                f"제목: {metadata['subject']}")
     preview = f"{heading}\n\n{preview_body}"
@@ -452,14 +579,15 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
     ready_action = status == "ready" and action != "editback"
     edit_action = status == "editing" and action in {"edit", "editback", "cancel"}
     if not (ready_action or edit_action):
-        answer("이미 처리했거나 수정 중입니다. 발송 상태가 불확실하면 메일함에서 확인하세요.")
+        answer(INTERRUPTED_SEND_NOTICE if status in {"interrupted", "uncertain"}
+               else "이미 처리했거나 수정 중입니다. 발송 상태가 불확실하면 메일함에서 확인하세요.")
         return
     account, password = accounts[mailbox]
     metadata = json.loads(metadata)
     next_status = {"send": "sending", "edit": "editing", "editback": "ready", "cancel": "canceled"}[action]
     with database:
-        # Keep only the in-memory copy once the user cancels or claims an SMTP send.
-        retained_body = body if action in {"edit", "editback"} else ""
+        # Retain the draft until delivery is confirmed or the user cancels it.
+        retained_body = "" if action == "cancel" else body
         changed = database.execute(
             "UPDATE reply_drafts SET status=?, body=? WHERE id=? AND status=?",
             (next_status, retained_body, draft, status),
@@ -499,25 +627,26 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         engine.telegram(token, "editMessageReplyMarkup", chat_id=chat, message_id=callback["message"]["message_id"],
                         reply_markup=reply_keyboard(draft))
         return
-    progress_id = callback["message"]["message_id"]
-    is_attachment = "document" in callback["message"]
+    preview = callback["message"]["message_id"]
     status_text = "회신 초안을 취소했습니다." if action == "cancel" else "회신 메일을 보내는 중입니다…"
     with suppress(OSError, RuntimeError):
         answer(status_text)
-    if not engine.update_progress(token, chat, progress_id, status_text, caption=is_attachment, clear_buttons=True):
-        with suppress(OSError, RuntimeError):
-            engine.telegram(token, "editMessageReplyMarkup", chat_id=chat, message_id=progress_id,
-                            quiet=True, request_timeout=5, reply_markup={"inline_keyboard": []})
-        progress_id = engine.post_progress(token, chat, status_text)
-        is_attachment = False
     if action == "cancel":
+        if not engine.update_progress(token, chat, preview, status_text,
+                                      caption="document" in callback["message"], clear_buttons=True):
+            clear_draft_buttons(engine, token, chat, preview)
+            engine.post_progress(token, chat, status_text, reply_to=preview)
         return
+    clear_draft_buttons(engine, token, chat, preview)
+    progress_id = engine.post_progress(token, chat, status_text, reply_to=preview)
     try:
-        status, reason = send_smtp(account, password, metadata, body, message_id)
+        message = make_reply_message(account, metadata, body, message_id)
+        status, reason = send_smtp(account, password, message, metadata["recipient"])
     except Exception as error:
         status, reason = "uncertain", type(error).__name__
     with database:
-        database.execute("UPDATE reply_drafts SET status=? WHERE id=?", (status, draft))
+        database.execute("UPDATE reply_drafts SET status=?, body=CASE WHEN ?='sent' THEN '' ELSE body END WHERE id=?",
+                         (status, status, draft))
     logging.info("SMTP 회신 결과 · %s · %s", status, reason or "접수")
     failure_detail = {
         "SMTPRecipientsRefused": "받는 주소가 서버에서 거절됐습니다.",
@@ -527,9 +656,18 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         "TimeoutError": "SMTP 서버 응답 시간이 초과됐습니다.",
     }.get(reason, "SMTP 연결 또는 서버 응답을 확인하세요.")
     result = {
-        "sent": "SMTP 서버가 회신 메일을 접수했습니다.",
-        "failed": f"회신 메일을 보내지 못했습니다. {failure_detail}",
-        "uncertain": "SMTP 접수 여부가 불명확합니다. 메일함을 확인하세요. 자동 재발송은 하지 않습니다.",
+        "sent": "✅ 발송 확인\nSMTP 서버가 회신 메일을 접수했습니다.",
+        "failed": f"❌ 발송 실패\n{failure_detail}",
+        "uncertain": "⚠️ 발송 상태 확인 필요\nSMTP 접수 여부가 불명확합니다. 자동 재발송은 하지 않습니다.",
     }[status]
-    if not engine.update_progress(token, chat, progress_id, result, caption=is_attachment):
-        engine.telegram(token, "sendMessage", chat_id=chat, text=result)
+    if status == "sent":
+        try:
+            save_sent_copy(account, password, message, metadata["recipient"])
+        except (OSError, RuntimeError, imaplib.IMAP4.error) as error:
+            detail = str(error) if type(error) is RuntimeError else type(error).__name__
+            logging.warning("IMAP 보낸 편지함 저장 실패 · %s", detail)
+            result += "\n⚠️ 보낸 편지함에 사본을 저장하지 못했습니다."
+        else:
+            result += "\n보낸 편지함에 사본을 저장했습니다."
+    if not engine.update_progress(token, chat, progress_id, result):
+        engine.post_progress(token, chat, result, reply_to=preview)
