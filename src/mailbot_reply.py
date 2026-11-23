@@ -28,6 +28,10 @@ def initialize(database):
             scope TEXT, chat INTEGER, message INTEGER, mailbox TEXT, metadata TEXT,
             PRIMARY KEY (scope, chat, message)
         );
+        CREATE TABLE IF NOT EXISTS mail_previews (
+            scope TEXT, chat INTEGER, message INTEGER, heading TEXT, body TEXT, filename TEXT, file_message INTEGER,
+            PRIMARY KEY (scope, chat, message)
+        );
         CREATE TABLE IF NOT EXISTS reply_drafts (
             id TEXT PRIMARY KEY, scope TEXT, chat INTEGER, target INTEGER,
             body TEXT, status TEXT, preview INTEGER, message_id TEXT, author INTEGER
@@ -90,11 +94,7 @@ def compose_reply(body, *, reply_greeting, reply_signature):
     return body
 
 
-def is_self_reply(account_address, recipient):
-    return account_address.strip().casefold() == recipient.strip().casefold()
-
-
-def target_metadata(raw, body, *, account_address):
+def target_metadata(raw, body):
     message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
     subject = str(message.get("Subject", "")).strip()
     if re.match(r"(?i)^\[Case Closed\]|^Your Cloudian Case\s+\d+$", subject):
@@ -108,7 +108,7 @@ def target_metadata(raw, body, *, account_address):
         return None
     address = recipients[0]
     recipient = address.addr_spec
-    if (not address.username or not address.domain or is_self_reply(account_address, recipient)
+    if (not address.username or not address.domain
             or re.search(r"[\x00-\x1f\x7f]", recipient)
             or re.fullmatch(r"(?i)(?:do[._-]?not[._-]?reply|no[._-]?reply)(?:[+._-].*)?", address.username)):
         return None
@@ -150,8 +150,6 @@ def verify_smtp(account, password):
 
 
 def send_smtp(account, password, metadata, body, message_id):
-    if is_self_reply(account["imap_user"], metadata["recipient"]):
-        return "failed", "자기 주소 회신 차단"
     message = EmailMessage(policy=policy.SMTP)
     message["From"] = account["imap_user"]
     message["To"] = metadata["recipient"]
@@ -286,6 +284,10 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         return
     if chat_info.get("id") != chat:
         return
+    if (callback and (group or private and author == chat)
+            and callback.get("data") in {"mailview:open", "mailview:close", "mailview:file"}):
+        engine.handle_mail_preview(database, scope, token, chat, callback)
+        return
     if not ((private and author == chat) or (group and author in settings.get("reply_allowed_users", []))):
         return
     if callback:
@@ -339,10 +341,6 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         return
     metadata = json.loads(row[1])
     account, _ = accounts[row[0]]
-    if is_self_reply(account["imap_user"], metadata["recipient"]):
-        engine.telegram(token, "sendMessage", chat_id=chat,
-                        text="이 알림의 회신 주소가 발신 계정과 같습니다. 상대방이 보낸 원본 메일 알림에 답장하세요.")
-        return
     progress_text = "수정한 회신으로 새 초안을 만드는 중입니다…" if revised else "회신 초안을 만드는 중입니다…"
     progress_id = engine.post_progress(token, chat, progress_text, reply_to=message.get("message_id"))
     try:
@@ -458,9 +456,6 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         return
     account, password = accounts[mailbox]
     metadata = json.loads(metadata)
-    if action in {"send", "edit"} and is_self_reply(account["imap_user"], metadata["recipient"]):
-        answer("받는 사람이 발신 계정과 같습니다. 상대방이 보낸 원본 메일 알림에 답장하세요.")
-        return
     next_status = {"send": "sending", "edit": "editing", "editback": "ready", "cancel": "canceled"}[action]
     with database:
         # Keep only the in-memory copy once the user cancels or claims an SMTP send.

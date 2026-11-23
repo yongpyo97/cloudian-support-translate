@@ -35,6 +35,9 @@ import truststore
 import mailbot_reply
 
 
+APP_VERSION = "1.0.3"
+
+
 class MailText(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -638,14 +641,92 @@ def attachment_filename(uid, heading):
     return f"{title or f'mail-{uid}'}.txt"
 
 
-def send_mail(token, chat_id, uid, message, report="", *, summary="", reply_enabled=False, progress_id=None):
+def mail_preview_keyboard(view):
+    label = {"open": "본문 보기 ▾", "close": "접기 ▴", "file": "본문 파일 받기"}[view]
+    return {"inline_keyboard": [[{"text": label, "callback_data": f"mailview:{view}"}]]}
+
+
+def handle_mail_preview(database, scope, token, chat_id, callback):
+    view = callback["data"].partition(":")[2]
+    message_id = callback["message"].get("message_id")
+    row = database.execute(
+        """SELECT heading, body, filename, file_message FROM mail_previews
+           WHERE scope = ? AND chat = ? AND message = ?""",
+        (scope, chat_id, message_id),
+    ).fetchone()
+    def answer(text=""):
+        telegram(token, "answerCallbackQuery", callback_query_id=callback["id"], text=text,
+                 quiet=True, request_timeout=5)
+
+    if not row:
+        answer("저장된 본문이 없습니다.")
+        return
+    heading, body, filename, file_message = row
+    if view == "file" and filename:
+        if file_message:
+            answer("이 알림에 답장으로 본문 파일을 보냈습니다.")
+            return
+        answer("본문 파일을 보내는 중입니다.")
+        try:
+            result = telegram(
+                token, "sendDocument", chat_id=chat_id,
+                document=(filename, body.encode("utf-8-sig")),
+                reply_parameters=json.dumps({"message_id": message_id}),
+            )
+        except (OSError, RuntimeError):
+            post_progress(token, chat_id, "본문 파일을 보내지 못했습니다. 버튼을 다시 눌러 주세요.",
+                          reply_to=message_id)
+            return
+        file_id = result["message_id"]
+        with database:
+            database.execute("UPDATE mail_previews SET file_message = ? WHERE scope = ? AND chat = ? AND message = ?",
+                             (file_id, scope, chat_id, message_id))
+            database.execute(
+                """INSERT OR IGNORE INTO reply_targets
+                   SELECT scope, chat, ?, mailbox, metadata FROM reply_targets
+                   WHERE scope = ? AND chat = ? AND message = ?""",
+                (file_id, scope, chat_id, message_id),
+            )
+        return
+    if view not in {"open", "close"} or filename:
+        answer()
+        return
+    text, next_view = (body, "close") if view == "open" else (heading, "open")
+    try:
+        telegram(token, "editMessageText", chat_id=chat_id, message_id=message_id, text=text,
+                 reply_markup=mail_preview_keyboard(next_view), link_preview_options={"is_disabled": True},
+                 quiet=True, request_timeout=8)
+    except TelegramRequestError as error:
+        if not error.unchanged:
+            answer("본문 표시를 바꾸지 못했습니다. 다시 시도해 주세요.")
+            return
+    except (OSError, RuntimeError):
+        answer("본문 표시를 바꾸지 못했습니다. 다시 시도해 주세요.")
+        return
+    answer()
+
+
+def send_mail(database, token, chat_id, uid, message, report="", *, summary="", reply_enabled=False, progress_id=None, interactive=True):
+    preview_enabled = interactive and "\n\n━━━━━━━\n" in message
     reply_hint = "메일 회신: 이 알림에 답장으로 본문을 작성하세요." if reply_enabled else ""
     if reply_hint:
         message += f"\n\n{reply_hint}"
     if report:
         report = report.splitlines()[0]
         message += f"\n\n{report}"
-    if len(message.encode("utf-16-le")) // 2 <= 4096:
+    fits = len(message.encode("utf-16-le")) // 2 <= 4096
+    if preview_enabled:
+        heading = (summary or message.split("\n\n", 1)[0])[:1000]
+        filename = None if fits else attachment_filename(uid, summary or heading)
+        result = publish_progress(token, chat_id, heading, progress_id=progress_id,
+                                  reply_markup=mail_preview_keyboard("file" if filename else "open"))
+        with database:
+            database.execute(
+                "INSERT OR REPLACE INTO mail_previews VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (mailbot_reply.scope_for(token), chat_id, result["message_id"], heading, message, filename),
+            )
+        return result
+    if fits:
         return publish_progress(token, chat_id, message, progress_id=progress_id)
     else:
         caption = {"caption": summary[:450] + "\n본문은 첨부파일에서 확인하세요."} if summary else {}
@@ -1303,9 +1384,7 @@ def find_legacy_reply(accounts, title, timestamp):
                     without_ref = re.sub(r"\s*\[\s*ref:![^\]\r\n]+:ref\s*\]\s*$", "", subject, flags=re.I)
                     if title.strip() not in {" ".join(subject.split()), " ".join(without_ref.split()) or "(제목 없음)"}:
                         continue
-                    matches.append((key, mailbot_reply.target_metadata(
-                        raw, compact_mail_text(body), account_address=account["imap_user"],
-                    )))
+                    matches.append((key, mailbot_reply.target_metadata(raw, compact_mail_text(body))))
                     if len(matches) > 1:
                         return None
     if len(matches) == 1 and matches[0][1]:
@@ -1375,14 +1454,14 @@ def mailbox_candidates(connection, settings, database, *, unread, include_unread
 
 
 def poll(settings, password, token, codex, database, *, unread=False, include_unread=False,
-         retranslate=None, retranslate_validity=None, interrupted=None):
+         retranslate=None, retranslate_validity=None, interrupted=None, interactive=False):
     poll_accounts([(settings, password, include_unread)], token, codex, database,
                   unread=unread, retranslate=retranslate, retranslate_validity=retranslate_validity,
-                  interrupted=interrupted)
+                  interrupted=interrupted, interactive=interactive)
 
 
 def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate=None,
-                  retranslate_validity=None, interrupted=None):
+                  retranslate_validity=None, interrupted=None, interactive=False):
     with ExitStack() as stack:
         mailboxes = []
         candidates = []
@@ -1413,7 +1492,8 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
             logging.info("메일 계정 %s 검사 · %s · 수신 %s",
                          index + 1, settings["imap_user"], received_text)
             fallback = process_mail(connection, settings, token, codex, database, key, validity, uid,
-                                    destination_keys=destination_keys, received=received, retranslate=retranslate)
+                                    destination_keys=destination_keys, received=received, retranslate=retranslate,
+                                    interactive=interactive)
             if fallback is not None:
                 fallbacks.append((index, validity, uid, received, fallback))
                 continue
@@ -1427,7 +1507,8 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
                 continue
             settings, connection, key, _, _ = mailboxes[index]
             process_mail(connection, settings, token, codex, database, key, validity, uid,
-                         destination_keys=destination_keys, received=received, retranslate=None, fallback_raw=raw)
+                         destination_keys=destination_keys, received=received, retranslate=None, fallback_raw=raw,
+                         interactive=interactive)
             checked(connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)"), "메일 읽음 표시")
         if not unread and retranslate is None:
             # A partial batch must remain discoverable even if UID and arrival order differ.
@@ -1441,7 +1522,7 @@ def poll_accounts(accounts, token, codex, database, *, unread=False, retranslate
 
 
 def process_mail(connection, settings, token, codex, database, key, validity, uid, *,
-                 destination_keys, received, retranslate, fallback_raw=None):
+                 destination_keys, received, retranslate, fallback_raw=None, interactive=False):
     chat_id = settings["telegram_chat_id"]
     if retranslate is None and database.execute(
         "SELECT 1 FROM handled WHERE mailbox = ? AND validity = ? AND uid = ?",
@@ -1480,9 +1561,7 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             (uid, validity, int(received.timestamp()) if received else 0, uid_subject(original_subject)),
         ])
         body = compact_mail_text(body)
-        reply_metadata = mailbot_reply.target_metadata(
-            raw, body, account_address=settings["imap_user"],
-        ) if settings.get("smtp_host") else None
+        reply_metadata = mailbot_reply.target_metadata(raw, body) if settings.get("smtp_host") else None
         subject = re.sub(r"\s*\[\s*ref:![^\]\r\n]+:ref\s*\]\s*$", "", original_subject, flags=re.IGNORECASE)
         body = clean_cloudian_case_confirmation(subject, body)
         support_key = cloudian_support_comment_key(subject, body)
@@ -1565,8 +1644,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         summary = message.split("\n\n", 1)[0]
         if retranslate is not None:
             try:
-                result = send_mail(token, chat_id, uid, message, summary=summary,
-                                   reply_enabled=bool(reply_metadata), progress_id=progress_id)
+                result = send_mail(database, token, chat_id, uid, message, summary=summary,
+                                   reply_enabled=bool(reply_metadata), progress_id=progress_id, interactive=interactive)
             except (OSError, RuntimeError):
                 update_progress(token, chat_id, progress_id, "텔레그램에서 재번역 결과의 전달 여부를 확인하지 못했습니다.")
                 raise
@@ -1587,12 +1666,11 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
                 "REPLACE INTO pending VALUES (?, ?, ?, ?)", (key, uid, json.dumps(payload), sent)
             )
     reply_metadata = payload.get("reply")
-    if reply_metadata and mailbot_reply.is_self_reply(settings["imap_user"], reply_metadata["recipient"]):
-        reply_metadata = None
     if "message" in payload and sent == 0:
-        result = send_mail(token, chat_id, uid, payload["message"],
+        result = send_mail(database, token, chat_id, uid, payload["message"],
                            payload.get("report", ""), summary=payload.get("summary", ""),
-                           reply_enabled=bool(reply_metadata), progress_id=payload.get("progress_id"))
+                           reply_enabled=bool(reply_metadata), progress_id=payload.get("progress_id"),
+                           interactive=interactive)
         with database:
             mailbot_reply.remember_target(database, token, chat_id, key, result, reply_metadata)
             database.execute("UPDATE pending SET sent = 1 WHERE mailbox = ?", (key,))

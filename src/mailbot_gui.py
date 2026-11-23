@@ -211,12 +211,12 @@ class MailWorker:
                     if account is None:
                         raise RuntimeError("선택한 메일 계정을 찾을 수 없습니다.")
                     self.engine.poll(settings | account, passwords[value[0]], token, codex, database,
-                                     retranslate=value[1], retranslate_validity=value[2])
+                                     retranslate=value[1], retranslate_validity=value[2], interactive=True)
                 else:
                     self.engine.poll_accounts([
                         (settings | account, passwords[account_key(account)], account_key(account) in first_checks)
                         for account in accounts
-                    ], token, codex, database, interrupted=self.interrupt.is_set)
+                    ], token, codex, database, interrupted=self.interrupt.is_set, interactive=True)
                     if not self.interrupt.is_set():
                         first_checks.clear()
             except NETWORK_ERRORS as error:
@@ -406,7 +406,7 @@ class Window:
         if self.config_error:
             self.notice.set("기존 설정 파일을 읽지 못했습니다. 로그와 설정 파일을 확인하세요.")
             logging.error("기존 설정 파일을 읽지 못했습니다.")
-        root.title(self.display_name.get())
+        root.title(f"{self.display_name.get()} · v{self.engine.APP_VERSION}")
         root.geometry("960x640")
         root.minsize(620, 450)
         root.protocol("WM_DELETE_WINDOW", self.close_window)
@@ -1141,7 +1141,7 @@ class Window:
         self.company_name = company_name
         name = app_display_name(company_name)
         self.display_name.set(name)
-        self.root.title(name)
+        self.root.title(f"{name} · v{self.engine.APP_VERSION}")
         self.tray.title = name
 
     def edit_company_name(self):
@@ -2108,7 +2108,7 @@ def run(engine, config, *, hidden=False):
         root.destroy()
         return 0
     with lock:
-        logging.info("%s 시작", APP_NAME)
+        logging.info("%s 시작 · v%s", APP_NAME, engine.APP_VERSION)
         window = Window(root, engine, config, hidden=hidden)
         if not hidden or not window.has_token:
             root.deiconify()
