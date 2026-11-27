@@ -2,7 +2,7 @@
 
 저장소를 내려받은 폴더를 Codex나 편집기에서 열어 수정할 수 있습니다.
 
-- `src/mailbot.py`는 메일 수신, 번역, Telegram 전송과 기본 프롬프트를 담고 있습니다.
+- `src/mailbot.py`는 GUI와 명령줄의 실행 진입점입니다. 메일 처리, 번역, Telegram 전송, 설정과 저장 기록은 `src/mailbot_*.py`에 있습니다.
 - `src/mailbot_gui.py`는 설정 화면, 트레이, 실행 중 설정 적용을 담당합니다.
 - `work/cloudian.ico`와 `work/cloudian-dark.ico`는 설정 창과 트레이에 사용하는 [Cloudian 로고](https://cloudian.com/company/brand-assets/)입니다.
 - `settings.example.json`은 개인 설정이 없는 예시입니다.
