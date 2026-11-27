@@ -35,7 +35,7 @@ import truststore
 import mailbot_reply
 
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.11"
 
 
 class MailText(HTMLParser):
@@ -717,6 +717,14 @@ def handle_mail_preview(database, scope, token, chat_id, callback):
     answer()
 
 
+def expandable_quote_entity(prefix, body):
+    return {
+        "type": "expandable_blockquote",
+        "offset": len(prefix.encode("utf-16-le")) // 2,
+        "length": len(body.encode("utf-16-le")) // 2,
+    }
+
+
 def send_mail(database, token, chat_id, uid, message, report="", *, summary="", reply_enabled=False, progress_id=None, interactive=True):
     preview_enabled = interactive and "\n\n━━━━━━━\n" in message
     reply_hint = "메일 회신: 이 알림에 답장으로 본문을 작성하세요." if reply_enabled else ""
@@ -728,11 +736,7 @@ def send_mail(database, token, chat_id, uid, message, report="", *, summary="", 
     fits = len(message.encode("utf-16-le")) // 2 <= 4096
     if preview_enabled and fits:
         heading, separator, body = message.partition("\n\n")
-        entity = {
-            "type": "expandable_blockquote",
-            "offset": len((heading + separator).encode("utf-16-le")) // 2,
-            "length": len(body.encode("utf-16-le")) // 2,
-        }
+        entity = expandable_quote_entity(heading + separator, body)
         return publish_progress(token, chat_id, message, progress_id=progress_id, entities=[entity])
     if preview_enabled:
         heading = (summary or message.split("\n\n", 1)[0])[:1000]
@@ -1388,6 +1392,22 @@ def imap_received_at(row):
             return timestamp
 
 
+def is_original_cloudian_reply(account, password, message_id):
+    quoted_id = '"' + message_id.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    with ExitStack() as stack:
+        connection = open_mailbox(stack, account, password)
+        rows = checked(connection.uid("SEARCH", None, "HEADER", "Message-ID", quoted_id), "Cloudian 원본 검색")
+        for uid in (rows[0] or b"").split():
+            data = checked(connection.uid("FETCH", uid, "(BODY.PEEK[])"), "Cloudian 원본 확인")
+            raw = next((part[1] for part in data if isinstance(part, tuple)), None)
+            if raw is not None:
+                _, body = mail_content(raw)
+                target = mailbot_reply.target_metadata(raw, compact_mail_text(body))
+                if target and target["cloudian_original"] and target["in_reply_to"] == message_id:
+                    return True
+    return False
+
+
 def find_legacy_reply(accounts, title, timestamp):
     # IMAP date searches use the server's calendar date. Check the adjacent
     # days as well, then compare the exact timestamp with its time zone.
@@ -1660,6 +1680,7 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             (uid, validity, int(received.timestamp()) if received else 0, uid_subject(original_subject)),
         ])
         body = compact_mail_text(body)
+        cloudian_copy = bool(mailbot_reply.CLOUDIAN_COPY.match(body.lstrip()))
         reply_metadata = mailbot_reply.target_metadata(raw, body) if settings.get("smtp_host") else None
         subject = re.sub(r"\s*\[\s*ref:![^\]\r\n]+:ref\s*\]\s*$", "", original_subject, flags=re.IGNORECASE)
         body = clean_cloudian_case_confirmation(subject, body)
@@ -1682,6 +1703,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
             logging.info("이미 전송한 Cloudian 알림을 건너뜁니다.")
             update_progress(token, chat_id, progress_id, "이미 전달된 Cloudian 알림입니다.")
             with database:
+                if support_key and reply_metadata and reply_metadata.get("cloudian_original"):
+                    mailbot_reply.link_cloudian_copy(database, token, chat_id, support_key, key, reply_metadata)
                 mark_handled(database, key, validity, uid)
             return
         if (retranslate is None and not preparing and fallback_raw is None and support_key
@@ -1747,6 +1770,8 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
         payload = {"message": message, "ack": case_id, "summary": summary}
         if support_key:
             payload["support_key"] = support_key
+            if cloudian_copy:
+                payload["cloudian_copy"] = True
         if progress_id:
             payload["progress_id"] = progress_id
         if reply_metadata:
@@ -1776,6 +1801,9 @@ def process_mail(connection, settings, token, codex, database, key, validity, ui
                            interactive=interactive)
         with database:
             mailbot_reply.remember_target(database, token, chat_id, key, result, reply_metadata)
+            if payload.get("cloudian_copy") and isinstance(result, dict) and isinstance(result.get("message_id"), int):
+                database.execute("INSERT OR IGNORE INTO cloudian_copy_alerts VALUES (?, ?, ?, ?)",
+                                 (mailbot_reply.scope_for(token), chat_id, payload["support_key"], result["message_id"]))
             database.execute("UPDATE pending SET sent = 1 WHERE mailbox = ?", (key,))
     parts = payload.get("parts", [])
     for index, part in enumerate(parts[sent:], start=sent):

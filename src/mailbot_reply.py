@@ -18,9 +18,10 @@ from subprocess import TimeoutExpired
 
 REPLY_MODEL = "gpt-5.6-sol"
 CLOUDIAN_CASE_SUBJECT = re.compile(
-    r"^(?:re\s*:\s*)?New (?:Case|Comment)\s+\[\d+\].*\[\s*(ref:![^\]\r\n]+:ref)\s*\]\s*$",
+    r"^(?:re\s*:\s*)?New (?:Case|Comment)\s+\[\d+\].*\[\s*ref:![^\]\r\n]+:ref\s*\]\s*$",
     re.IGNORECASE,
 )
+CLOUDIAN_COPY = re.compile(r"(?i)^[ \t]*Email from Cloudian[ \t]*-[ \t]*From:")
 
 
 def scope_for(token):
@@ -42,6 +43,14 @@ def initialize(database):
             body TEXT, status TEXT, preview INTEGER, message_id TEXT, author INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS reply_preview ON reply_drafts(scope, chat, preview);
+        CREATE TABLE IF NOT EXISTS sent_copy_jobs (
+            draft TEXT PRIMARY KEY, scope TEXT, chat INTEGER, preview INTEGER, mailbox TEXT,
+            message_id TEXT, payload BLOB, attempts INTEGER DEFAULT 0, retry_at REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS cloudian_copy_alerts (
+            scope TEXT, chat INTEGER, comment_key TEXT, message INTEGER,
+            PRIMARY KEY (scope, chat, comment_key)
+        );
         CREATE TABLE IF NOT EXISTS reply_offsets (scope TEXT PRIMARY KEY, next_update INTEGER);
         CREATE TABLE IF NOT EXISTS telegram_reply_jobs (
             scope TEXT, chat INTEGER, update_id INTEGER, payload TEXT,
@@ -113,16 +122,12 @@ def reply_subject(subject):
     return f"Re: {subject}" if subject else "Re: (제목 없음)"
 
 
-def add_case_reference(subject, body):
-    case = CLOUDIAN_CASE_SUBJECT.match(subject)
-    if case and case[1] not in body:
-        return f"{body.rstrip()}\n\n{case[1]}"
-    return body
-
-
 def target_metadata(raw, body):
     message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
     subject = str(message.get("Subject", "")).strip()
+    cloudian = bool(CLOUDIAN_CASE_SUBJECT.match(subject))
+    if cloudian and CLOUDIAN_COPY.match(body.lstrip()):
+        return None
     if re.match(r"(?i)^\[Case Closed\]|^Your Cloudian Case\s+\d+$", subject):
         return None
     if re.search(r"(?i)\bdo\s+not\s+(?:reply|respond)\s+to\s+this\s+(?:e-?mail|message)\b|"
@@ -143,7 +148,8 @@ def target_metadata(raw, body):
     if not re.fullmatch(r"<[^\s<>]+@[^\s<>]+>", message_id):
         message_id = ""
     references = re.findall(r"<[^\s<>]+@[^\s<>]+>", str(message.get("References", "")))[-15:]
-    return {"recipient": recipient, "subject": subject, "in_reply_to": message_id, "references": references}
+    return {"recipient": recipient, "subject": subject, "in_reply_to": message_id, "references": references,
+            "cloudian_original": cloudian}
 
 
 def remember_target(database, token, chat, mailbox, result, metadata):
@@ -154,8 +160,31 @@ def remember_target(database, token, chat, mailbox, result, metadata):
         )
 
 
+def link_cloudian_copy(database, token, chat, comment_key, mailbox, metadata):
+    scope = scope_for(token)
+    row = database.execute(
+        """SELECT a.message, p.file_message FROM cloudian_copy_alerts a
+           LEFT JOIN mail_previews p ON p.scope=a.scope AND p.chat=a.chat AND p.message=a.message
+           WHERE a.scope=? AND a.chat=? AND a.comment_key=?""",
+        (scope, chat, comment_key),
+    ).fetchone()
+    if row:
+        for message in row:
+            remember_target(database, token, chat, mailbox, {"message_id": message}, metadata)
+        database.execute("DELETE FROM cloudian_copy_alerts WHERE scope=? AND chat=? AND comment_key=?",
+                         (scope, chat, comment_key))
+
+
+class TrackedSMTP(smtplib.SMTP_SSL):
+    data_result = None
+
+    def data(self, message):
+        self.data_result = super().data(message)
+        return self.data_result
+
+
 def smtp_login(account, password):
-    connection = smtplib.SMTP_SSL(
+    connection = TrackedSMTP(
         account["smtp_host"], account.get("smtp_port", 465), timeout=20, context=ssl.create_default_context(),
     )
     try:
@@ -186,7 +215,7 @@ def make_reply_message(account, metadata, body, message_id):
     references = list(dict.fromkeys(ref for ref in [*metadata["references"], metadata["in_reply_to"]] if ref))
     if references:
         message["References"] = " ".join(references)
-    message.set_content(add_case_reference(metadata["subject"], body))
+    message.set_content(body)
     return message
 
 
@@ -194,17 +223,32 @@ def send_smtp(account, password, message, recipient):
     try:
         connection = smtp_login(account, password)
     except (OSError, smtplib.SMTPException) as error:
+        log_smtp_trace(message, getattr(error, "smtp_code", None))
         return "failed", type(error).__name__
     try:
         connection.send_message(message, from_addr=account["imap_user"], to_addrs=[recipient])
+        code, response = connection.data_result or (None, b"")
+        log_smtp_trace(message, code, response)
         return "sent", ""
     except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
+        code = (next(iter(error.recipients.values()))[0] if isinstance(error, smtplib.SMTPRecipientsRefused)
+                else error.smtp_code)
+        log_smtp_trace(message, code)
         return "failed", type(error).__name__
     except (OSError, smtplib.SMTPException) as error:
+        log_smtp_trace(message, getattr(error, "smtp_code", None))
         return "uncertain", type(error).__name__
     finally:
         with suppress(OSError):
             connection.close()
+
+
+def log_smtp_trace(message, code, response=b""):
+    queue_id = re.search(rb"\b(?:queued\s+as\s+|(?:queue[ -]?id|internalid|id)\s*[:=]\s*)"
+                         rb"([A-Za-z0-9][A-Za-z0-9_.-]{0,79})(?=[ \t\r\n;,]|$)", response, re.I)
+    logging.info("SMTP 추적 · Message-ID %s · 응답 %s · 큐 ID %s",
+                 message["Message-ID"], code if code is not None else "없음",
+                 queue_id[1].decode("ascii") if queue_id else "없음")
 
 
 def find_sent_folder(entries):
@@ -234,7 +278,7 @@ def find_sent_folder(entries):
     raise RuntimeError("SentFolderMissing")
 
 
-def save_sent_copy(account, password, message, recipient):
+def save_sent_copy(account, password, message_id, payload, *, check_existing):
     with imaplib.IMAP4_SSL(
         account["imap_host"], account.get("imap_port", 993), timeout=20, ssl_context=ssl.create_default_context(),
     ) as connection:
@@ -243,10 +287,53 @@ def save_sent_copy(account, password, message, recipient):
         if status != "OK":
             raise RuntimeError("SentFolderListFailed")
         folder = find_sent_folder(entries)
-        mail_policy = policy.SMTP if account["imap_user"].isascii() and recipient.isascii() else policy.SMTPUTF8
-        status, _ = connection.append(folder, r"\Seen", None, message.as_bytes(policy=mail_policy))
+        if check_existing:
+            status, _ = connection.select(folder, readonly=True)
+            if status != "OK":
+                raise RuntimeError("SentFolderSelectFailed")
+            status, hits = connection.uid("SEARCH", None, "HEADER", "Message-ID", f'"{message_id}"')
+            if status != "OK":
+                raise RuntimeError("SentCopySearchFailed")
+            if hits and hits[0]:
+                return
+        status, _ = connection.append(folder, r"\Seen", None, payload)
         if status != "OK":
             raise RuntimeError("SentCopyAppendRejected")
+
+
+def process_sent_copy(database, draft, account, password):
+    row = database.execute("SELECT message_id, payload, attempts FROM sent_copy_jobs WHERE draft=?", (draft,)).fetchone()
+    if row is None:
+        return False
+    message_id, payload, attempts = row
+    with database:
+        database.execute("UPDATE sent_copy_jobs SET attempts=attempts+1, retry_at=? WHERE draft=?",
+                         (time.time() + 60, draft))
+    try:
+        save_sent_copy(account, password, message_id, payload, check_existing=bool(attempts))
+    except (OSError, RuntimeError, imaplib.IMAP4.error) as error:
+        detail = str(error) if type(error) is RuntimeError else type(error).__name__
+        logging.warning("IMAP 보낸 편지함 저장 재시도 예정 · Message-ID %s · %s", message_id, detail)
+        return False
+    with database:
+        database.execute("DELETE FROM sent_copy_jobs WHERE draft=?", (draft,))
+    return True
+
+
+def retry_sent_copies(engine, database, settings, accounts, token):
+    scope, chat = scope_for(token), int(settings["telegram_chat_id"])
+    archive_accounts = {engine.uid_directory_key(account): (account, password)
+                        for account, password in accounts.values()}
+    jobs = database.execute(
+        "SELECT draft, mailbox, scope, chat, preview FROM sent_copy_jobs WHERE retry_at<=? ORDER BY retry_at",
+        (time.time(),),
+    )
+    for draft, mailbox, previous_scope, previous_chat, preview in jobs.fetchall():
+        if mailbox in archive_accounts:
+            saved = process_sent_copy(database, draft, *archive_accounts[mailbox])
+            if saved and preview and (scope, chat) == (previous_scope, previous_chat):
+                engine.post_progress(token, chat, "보낸 편지함에 회신 사본을 저장했습니다.", reply_to=preview)
+            return
 
 
 def check_updates(engine, database, settings, accounts, token, codex, *, interrupted=None, wake_replies=None):
@@ -465,6 +552,10 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         engine.telegram(token, "sendMessage", chat_id=chat, text="회신 초안은 2,300자 이하로 입력하세요.")
         return
     metadata = json.loads(row[1])
+    if not verify_cloudian_target(engine, accounts[row[0]], metadata):
+        engine.post_progress(token, chat, "Cloudian 원본 메일을 확인할 수 없습니다. 원본 UID를 재번역한 뒤 답장하세요.",
+                             reply_to=target)
+        return
     metadata["subject"] = reply_subject(metadata["subject"])
     account, _ = accounts[row[0]]
     progress_text = "수정한 회신으로 새 초안을 만드는 중입니다…" if revised else "회신 초안을 만드는 중입니다…"
@@ -477,10 +568,10 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
         if not engine.update_progress(token, chat, progress_id, notice):
             engine.telegram(token, "sendMessage", chat_id=chat, text=notice)
         return
-    preview_body = add_case_reference(metadata["subject"], preview_body)
     heading = (f"메일 회신 초안\n보내는 사람: {account['imap_user']}\n받는 사람: {metadata['recipient']}\n"
                f"제목: {metadata['subject']}")
-    preview = f"{heading}\n\n{preview_body}"
+    prefix = f"{heading}\n\n"
+    preview = prefix + preview_body
     draft = secrets.token_hex(12)
     with database:
         database.execute("INSERT INTO reply_drafts VALUES (?, ?, ?, ?, ?, 'ready', NULL, ?, ?)",
@@ -488,7 +579,9 @@ def handle_update(engine, database, scope, chat, accounts, token, codex, setting
     markup = reply_keyboard(draft)
     try:
         if len(preview.encode("utf-16-le")) // 2 <= 4096:
-            result = engine.publish_progress(token, chat, preview, progress_id=progress_id, reply_markup=markup)
+            entity = engine.expandable_quote_entity(prefix, preview_body)
+            result = engine.publish_progress(token, chat, preview, progress_id=progress_id, reply_markup=markup,
+                                             entities=[entity])
         else:
             result = engine.publish_progress(token, chat, heading[:440] + "\n첨부에서 발송할 본문을 확인하세요.",
                                              progress_id=progress_id, reply_markup=markup,
@@ -558,6 +651,13 @@ def resolve_legacy_target(engine, accounts, alert):
     return engine.find_legacy_reply(accounts, title[1], timestamp)
 
 
+def verify_cloudian_target(engine, account, metadata):
+    if not CLOUDIAN_CASE_SUBJECT.match(metadata["subject"]) or metadata.get("cloudian_original"):
+        return True
+    message_id = metadata["in_reply_to"]
+    return bool(message_id and engine.is_original_cloudian_reply(*account, message_id))
+
+
 def handle_callback(engine, database, scope, chat, accounts, token, callback, author, private):
     match = re.fullmatch(r"mr:(send|edit|editback|cancel):([0-9a-f]{24})", callback.get("data", ""))
     if not match:
@@ -584,6 +684,9 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         return
     account, password = accounts[mailbox]
     metadata = json.loads(metadata)
+    if action == "send" and not verify_cloudian_target(engine, (account, password), metadata):
+        answer("Cloudian 원본을 확인할 수 없습니다. 원본 UID를 재번역한 뒤 답장하세요.")
+        return
     next_status = {"send": "sending", "edit": "editing", "editback": "ready", "cancel": "canceled"}[action]
     with database:
         # Retain the draft until delivery is confirmed or the user cancels it.
@@ -641,12 +744,25 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
     progress_id = engine.post_progress(token, chat, status_text, reply_to=preview)
     try:
         message = make_reply_message(account, metadata, body, message_id)
-        status, reason = send_smtp(account, password, message, metadata["recipient"])
-    except Exception as error:
-        status, reason = "uncertain", type(error).__name__
+        recipient = metadata["recipient"]
+        mail_policy = policy.SMTP if account["imap_user"].isascii() and recipient.isascii() else policy.SMTPUTF8
+        payload = message.as_bytes(policy=mail_policy)
+        archive_mailbox = engine.uid_directory_key(account)
+    except (ValueError, TypeError) as error:
+        status, reason = "failed", type(error).__name__
+    else:
+        try:
+            status, reason = send_smtp(account, password, message, recipient)
+        except Exception as error:
+            status, reason = "uncertain", type(error).__name__
     with database:
         database.execute("UPDATE reply_drafts SET status=?, body=CASE WHEN ?='sent' THEN '' ELSE body END WHERE id=?",
                          (status, status, draft))
+        if status == "sent":
+            database.execute(
+                """INSERT INTO sent_copy_jobs (draft, scope, chat, preview, mailbox, message_id, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""", (draft, scope, chat, preview, archive_mailbox, message_id, payload),
+            )
     logging.info("SMTP 회신 결과 · %s · %s", status, reason or "접수")
     failure_detail = {
         "SMTPRecipientsRefused": "받는 주소가 서버에서 거절됐습니다.",
@@ -654,6 +770,7 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         "SMTPAuthenticationError": "SMTP 로그인에 실패했습니다.",
         "SMTPDataError": "SMTP 서버가 메일을 거절했습니다.",
         "TimeoutError": "SMTP 서버 응답 시간이 초과됐습니다.",
+        "ValueError": "메일을 구성하지 못했습니다. 새 초안을 만들어 주세요.",
     }.get(reason, "SMTP 연결 또는 서버 응답을 확인하세요.")
     result = {
         "sent": "✅ 발송 확인\nSMTP 서버가 회신 메일을 접수했습니다.",
@@ -661,13 +778,9 @@ def handle_callback(engine, database, scope, chat, accounts, token, callback, au
         "uncertain": "⚠️ 발송 상태 확인 필요\nSMTP 접수 여부가 불명확합니다. 자동 재발송은 하지 않습니다.",
     }[status]
     if status == "sent":
-        try:
-            save_sent_copy(account, password, message, metadata["recipient"])
-        except (OSError, RuntimeError, imaplib.IMAP4.error) as error:
-            detail = str(error) if type(error) is RuntimeError else type(error).__name__
-            logging.warning("IMAP 보낸 편지함 저장 실패 · %s", detail)
-            result += "\n⚠️ 보낸 편지함에 사본을 저장하지 못했습니다."
-        else:
+        if process_sent_copy(database, draft, account, password):
             result += "\n보낸 편지함에 사본을 저장했습니다."
+        else:
+            result += "\n⚠️ 보낸 편지함 사본 저장을 다시 시도합니다."
     if not engine.update_progress(token, chat, progress_id, result):
         engine.post_progress(token, chat, result, reply_to=preview)
